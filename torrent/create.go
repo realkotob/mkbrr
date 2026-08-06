@@ -3,14 +3,15 @@ package torrent
 import (
 	"crypto/rand"
 	"fmt"
+	"math/bits"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/anacrolix/torrent/bencode"
-	"github.com/anacrolix/torrent/metainfo"
+	"github.com/autobrr/go-torrent/bencode"
+	"github.com/autobrr/go-torrent/metainfo"
 	"github.com/fatih/color"
 
 	"github.com/autobrr/mkbrr/internal/preset"
@@ -24,6 +25,63 @@ func formatPieceSize(exp uint) string {
 		return fmt.Sprintf("%d MiB", size/1024)
 	}
 	return fmt.Sprintf("%d KiB", size)
+}
+
+// calculatePieceLengthFromTarget derives a piece length exponent from a target piece count.
+// The result is clamped to [minExp, maxExp] where maxExp considers tracker and user constraints.
+func calculatePieceLengthFromTarget(totalSize int64, targetCount uint, maxPieceLength *uint, trackerURLs []string, verbose bool) uint {
+	minExp := uint(16) // 64 KiB minimum
+	maxExp := uint(24) // default max 16 MiB, same as auto-calc
+
+	// resolve ceiling: tracker hard cap (if any), then user max, then default 24
+	trackerCap := uint(0)
+	if len(trackerURLs) > 0 && trackerURLs[0] != "" {
+		if trackerMaxExp, ok := trackers.GetTrackerMaxPieceLength(trackerURLs[0]); ok {
+			trackerCap = trackerMaxExp
+		}
+	}
+
+	if maxPieceLength != nil {
+		userMax := min(*maxPieceLength, 27)
+		if trackerCap > 0 {
+			// tracker cap is a hard ceiling; user can lower but not exceed it
+			maxExp = min(userMax, trackerCap)
+		} else {
+			// no tracker cap: user max can raise above default 24
+			maxExp = userMax
+		}
+	} else if trackerCap > 0 {
+		maxExp = trackerCap
+	}
+
+	// ensure maxExp is at least minExp
+	maxExp = max(maxExp, minExp)
+
+	// guard: targetCount == 0 or totalSize < targetCount → ratio would be 0
+	ratio := uint64(0)
+	if targetCount > 0 && totalSize > 0 {
+		ratio = uint64(totalSize) / uint64(targetCount)
+	}
+
+	var exp uint
+	if ratio == 0 {
+		exp = minExp
+	} else {
+		// floor(log2(ratio)) via bit length
+		exp = uint(bits.Len64(ratio)) - 1
+	}
+
+	// clamp to bounds
+	clamped := min(max(exp, minExp), maxExp)
+
+	if verbose && clamped != exp {
+		display := NewDisplay(NewFormatter(verbose))
+		actualPieces := (uint64(totalSize) + (1 << clamped) - 1) / (1 << clamped)
+		display.ShowMessage(fmt.Sprintf("target piece count %d adjusted: using %s pieces (%d actual pieces) due to constraints",
+			targetCount, formatPieceSize(clamped), actualPieces))
+	}
+
+	return clamped
 }
 
 // calculatePieceLength calculates the optimal piece length based on total size.
@@ -59,49 +117,42 @@ func calculatePieceLength(totalSize int64, maxPieceLength *uint, trackerURLs []s
 		maxExp = min(*maxPieceLength, 27)
 	}
 
-	// default calculation for automatic piece length
-	// ensure minimum of 1 byte for calculation
-	size := max(totalSize, 1)
+	// default calculation for automatic piece length using shared default ranges
+	size := uint64(max(totalSize, 1))
 
 	var exp uint
-	switch {
-	case size <= 64<<20: // 0 to 64 MB: 32 KiB pieces (2^15)
-		exp = 15
-	case size <= 128<<20: // 64-128 MB: 64 KiB pieces (2^16)
-		exp = 16
-	case size <= 256<<20: // 128-256 MB: 128 KiB pieces (2^17)
-		exp = 17
-	case size <= 512<<20: // 256-512 MB: 256 KiB pieces (2^18)
-		exp = 18
-	case size <= 1024<<20: // 512 MB-1 GB: 512 KiB pieces (2^19)
-		exp = 19
-	case size <= 2048<<20: // 1-2 GB: 1 MiB pieces (2^20)
-		exp = 20
-	case size <= 4096<<20: // 2-4 GB: 2 MiB pieces (2^21)
-		exp = 21
-	case size <= 8192<<20: // 4-8 GB: 4 MiB pieces (2^22)
-		exp = 22
-	case size <= 16384<<20: // 8-16 GB: 8 MiB pieces (2^23)
-		exp = 23
-	case size <= 32768<<20: // 16-32 GB: 16 MiB pieces (2^24)
-		exp = 24
-	case size <= 65536<<20: // 32-64 GB: 32 MiB pieces (2^25)
-		exp = 25
-	case size <= 131072<<20: // 64-128 GB: 64 MiB pieces (2^26)
-		exp = 26
-	default: // above 128 GB: 128 MiB pieces (2^27)
-		exp = 27
-	}
-
-	// if no manual piece length was specified, cap at 2^24
-	if maxPieceLength == nil {
-		exp = min(exp, 24)
+	for _, r := range trackers.DefaultPieceSizeRanges {
+		if size <= r.MaxSize {
+			exp = r.PieceExp
+			break
+		}
 	}
 
 	// ensure we stay within bounds
 	exp = min(exp, maxExp)
 
 	return exp
+}
+
+// GetRecommendedPieceLengthExp returns the effective tracker-specific piece
+// length exponent for display. It mirrors the automatic create path's bounds.
+func GetRecommendedPieceLengthExp(trackerURL string, contentSize uint64) uint {
+	if trackerURL == "" {
+		return 0
+	}
+
+	exp, ok := trackers.GetTrackerPieceSizeExp(trackerURL, contentSize)
+	if !ok {
+		return 0
+	}
+
+	minExp := uint(16)
+	maxExp := uint(24)
+	if trackerMaxExp, ok := trackers.GetTrackerMaxPieceLength(trackerURL); ok {
+		maxExp = trackerMaxExp
+	}
+
+	return min(max(exp, minExp), maxExp)
 }
 
 func (t *Torrent) GetInfo() *metainfo.Info {
@@ -128,6 +179,10 @@ func CreateTorrent(opts CreateOptions) (*Torrent, error) {
 		// preserve the folder name even for single-file torrents
 		name = filepath.Base(filepath.Clean(path))
 	}
+	// the name has to resolve on a byte-exact filesystem just like the entries
+	// in info.files do: it is the filename for a single-file torrent and the
+	// root folder for a multi-file one
+	name = nfcPath(filepath.Dir(filepath.Clean(path)), name)
 
 	mi := &metainfo.MetaInfo{
 		Comment: opts.Comment,
@@ -341,6 +396,7 @@ func CreateTorrent(opts CreateOptions) (*Torrent, error) {
 					originalFilepath = files[0].path // Fallback if mapping missing
 				}
 				relPath, _ := filepath.Rel(baseDir, originalFilepath)
+				relPath = nfcPath(baseDir, relPath)
 				pathComponents := strings.Split(filepath.ToSlash(relPath), "/") // Ensure forward slashes
 				info.Files[0] = metainfo.FileInfo{
 					Path:   pathComponents,
@@ -359,6 +415,7 @@ func CreateTorrent(opts CreateOptions) (*Torrent, error) {
 					originalFilepath = f.path // Fallback if mapping missing
 				}
 				relPath, _ := filepath.Rel(baseDir, originalFilepath)
+				relPath = nfcPath(baseDir, relPath)
 				pathComponents := strings.Split(filepath.ToSlash(relPath), "/") // Ensure forward slashes
 				info.Files[i] = metainfo.FileInfo{
 					Path:   pathComponents,
@@ -394,8 +451,32 @@ func CreateTorrent(opts CreateOptions) (*Torrent, error) {
 		return &Torrent{mi}, nil
 	}
 
+	// validate mutual exclusion at the API level (CLI validates this too, but exported callers may not)
+	if opts.PieceLengthExp != nil && opts.TargetPieceCount != nil {
+		return nil, fmt.Errorf("cannot use both piece length and target piece count; use one or the other")
+	}
+
 	var pieceLength uint
-	if opts.PieceLengthExp == nil {
+	if opts.PieceLengthExp == nil && opts.TargetPieceCount != nil {
+		if *opts.TargetPieceCount == 0 {
+			return nil, fmt.Errorf("target piece count must be greater than zero")
+		}
+		// validate max-piece-length the same way the automatic path does
+		if opts.MaxPieceLength != nil {
+			maxExp := uint(27)
+			if len(opts.TrackerURLs) > 0 && opts.TrackerURLs[0] != "" {
+				if trackerMaxExp, ok := trackers.GetTrackerMaxPieceLength(opts.TrackerURLs[0]); ok {
+					maxExp = trackerMaxExp
+				}
+			}
+			if *opts.MaxPieceLength < 14 || *opts.MaxPieceLength > maxExp {
+				return nil, fmt.Errorf("max piece length exponent must be between 14 (16 KiB) and %d (%d MiB), got: %d",
+					maxExp, 1<<(maxExp-20), *opts.MaxPieceLength)
+			}
+		}
+		// target piece count mode: derive piece length from target count
+		pieceLength = calculatePieceLengthFromTarget(totalSize, *opts.TargetPieceCount, opts.MaxPieceLength, opts.TrackerURLs, opts.Verbose)
+	} else if opts.PieceLengthExp == nil {
 		if opts.MaxPieceLength != nil {
 			// Get tracker's max piece length if available
 			maxExp := uint(27) // absolute max 128 MiB
@@ -467,8 +548,27 @@ func CreateTorrent(opts CreateOptions) (*Torrent, error) {
 				return nil, fmt.Errorf("error marshaling torrent data: %w", err)
 			}
 
+			// Determine the effective max piece length ceiling
+			maxPieceLengthCeiling := uint(24) // default ceiling
+			hasTrackerCap := false
+			if len(opts.TrackerURLs) > 0 && opts.TrackerURLs[0] != "" {
+				if trackerMaxExp, ok := trackers.GetTrackerMaxPieceLength(opts.TrackerURLs[0]); ok {
+					maxPieceLengthCeiling = trackerMaxExp
+					hasTrackerCap = true
+				}
+			}
+			if opts.MaxPieceLength != nil {
+				if hasTrackerCap {
+					// tracker cap is a hard ceiling; user can lower but not exceed it
+					maxPieceLengthCeiling = min(*opts.MaxPieceLength, maxPieceLengthCeiling)
+				} else {
+					// no tracker cap; user can raise above default 24
+					maxPieceLengthCeiling = min(*opts.MaxPieceLength, 27)
+				}
+			}
+
 			// If it exceeds limit, try increasing piece length until it fits or we hit max
-			for uint64(len(torrentData)) > maxSize && pieceLength < 24 {
+			for uint64(len(torrentData)) > maxSize && pieceLength < maxPieceLengthCeiling {
 				if opts.Verbose || opts.InfoOnly {
 					display := NewDisplay(NewFormatter(opts.Verbose || opts.InfoOnly))
 					display.SetQuiet(opts.Quiet || opts.InfoOnly)

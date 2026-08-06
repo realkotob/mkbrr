@@ -52,6 +52,11 @@
             "minimum": 14,
             "maximum": 24
           },
+          "target_piece_count": {
+            "type": "integer",
+            "description": "Target approximate number of pieces (calculates optimal piece length). Mutually exclusive with piece_length.",
+            "minimum": 1
+          },
           "comment": {
             "type": "string",
             "description": "Torrent comment"
@@ -63,6 +68,11 @@
           "no_date": {
             "type": "boolean",
             "description": "Don't write creation date",
+            "default": false
+          },
+          "skip_prefix": {
+            "type": "boolean",
+            "description": "Don't add tracker domain prefix to output filename",
             "default": false
           },
           "entropy": {
@@ -83,6 +93,11 @@
             "items": {
               "type": "string"
             }
+          },
+          "fail_on_season_warning": {
+            "type": "boolean",
+            "description": "Exit with error if season pack completeness check detects missing episodes",
+            "default": false
           }
         }
       }

@@ -3,19 +3,20 @@ package torrent
 import (
 	"os"
 
-	"github.com/anacrolix/torrent/metainfo"
+	"github.com/autobrr/go-torrent/metainfo"
 )
 
-// ProgressCallback is called during torrent creation to report progress.
+// ProgressCallback is called during hashing to report progress.
 // completed: number of pieces hashed so far
 // total: total number of pieces to hash
-// hashRate: current hashing rate in bytes per second
+// hashRate: current hashing rate in MiB per second
 type ProgressCallback func(completed, total int, hashRate float64)
 
 // CreateOptions contains all options for creating a torrent
 type CreateOptions struct {
 	PieceLengthExp          *uint
 	MaxPieceLength          *uint
+	TargetPieceCount        *uint
 	Path                    string
 	Name                    string
 	TrackerURLs             []string
@@ -39,7 +40,7 @@ type CreateOptions struct {
 	FailOnSeasonPackWarning bool
 	// ProgressCallback is called during hashing to report progress.
 	// If nil, no progress callbacks will be made.
-	ProgressCallback        ProgressCallback
+	ProgressCallback ProgressCallback
 }
 
 // Torrent represents a torrent file with additional functionality
@@ -106,7 +107,7 @@ func (c *callbackDisplayer) ShowProgress(total int) {
 // UpdateProgress implements Displayer interface
 func (c *callbackDisplayer) UpdateProgress(completed int, hashrate float64) {
 	if c.callback != nil {
-		c.callback(completed, c.total, hashrate)
+		c.callback(completed, c.total, hashrate/(1024*1024))
 	}
 }
 
